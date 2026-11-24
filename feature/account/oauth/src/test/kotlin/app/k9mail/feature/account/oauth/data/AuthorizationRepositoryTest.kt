@@ -40,10 +40,27 @@ class AuthorizationRepositoryTest {
     private val service: AuthorizationService = mock<AuthorizationService>()
 
     @Test
+    fun `getAuthorizationRequestIntent uses loopback activity for loopback configuration`() {
+        val testSubject = AuthorizationRepository(
+            service = service,
+            context = androidx.test.core.app.ApplicationProvider.getApplicationContext(),
+        )
+
+        val result = testSubject.getAuthorizationRequestIntent(
+            oAuthConfiguration.copy(redirectUri = "http://127.0.0.1"),
+            "user@example.com",
+        ) as AuthorizationIntentResult.Success
+
+        assertThat(result.intent.component?.className)
+            .isEqualTo("app.k9mail.feature.account.oauth.ui.LoopbackOAuthActivity")
+    }
+
+    @Test
     fun `getAuthorizationRequestIntent should return Success with intent when hostname has oauth configuration`() =
         runTest {
             val testSubject = AuthorizationRepository(
                 service = service,
+                context = androidx.test.core.app.ApplicationProvider.getApplicationContext(),
             )
             val emailAddress = "emailAddress"
             val intent = Intent()
@@ -84,6 +101,7 @@ class AuthorizationRepositoryTest {
     fun `getAuthorizationResponse should return AuthorizationResponse when intent invalid`() = runTest {
         val testSubject = AuthorizationRepository(
             service = service,
+            context = androidx.test.core.app.ApplicationProvider.getApplicationContext(),
         )
         val intent = Intent().apply {
             putExtra(AuthorizationResponse.EXTRA_RESPONSE, authorizationResponse.jsonSerializeString())
@@ -114,6 +132,7 @@ class AuthorizationRepositoryTest {
     fun `getAuthorizationResponse should return null when intent is invalid`() = runTest {
         val testSubject = AuthorizationRepository(
             service = service,
+            context = androidx.test.core.app.ApplicationProvider.getApplicationContext(),
         )
         val intent = Intent()
 
@@ -128,6 +147,7 @@ class AuthorizationRepositoryTest {
     fun `getAuthorizationException should return AuthorizationException when intent is valid`() = runTest {
         val testSubject = AuthorizationRepository(
             service = service,
+            context = androidx.test.core.app.ApplicationProvider.getApplicationContext(),
         )
         val authorizationException = AuthorizationException(
             AuthorizationException.TYPE_OAUTH_AUTHORIZATION_ERROR,
@@ -152,6 +172,7 @@ class AuthorizationRepositoryTest {
     fun `getAuthorizationException should return null when intent is invalid`() = runTest {
         val testSubject = AuthorizationRepository(
             service = service,
+            context = androidx.test.core.app.ApplicationProvider.getApplicationContext(),
         )
         val intent = Intent()
 
@@ -166,6 +187,7 @@ class AuthorizationRepositoryTest {
     fun `getExchangeToken should return success when tokenRequest successful`() = runTest {
         val testSubject = AuthorizationRepository(
             service = service,
+            context = androidx.test.core.app.ApplicationProvider.getApplicationContext(),
         )
         val tokenRequest = TokenRequest.Builder(
             authorizationConfiguration,
@@ -194,6 +216,7 @@ class AuthorizationRepositoryTest {
     fun `getExchangeToken should return failure when tokenRequest failure`() = runTest {
         val testSubject = AuthorizationRepository(
             service = service,
+            context = androidx.test.core.app.ApplicationProvider.getApplicationContext(),
         )
         val authorizationException = AuthorizationException(
             AuthorizationException.TYPE_OAUTH_AUTHORIZATION_ERROR,
@@ -218,6 +241,7 @@ class AuthorizationRepositoryTest {
     fun `getExchangeToken should return unknown failure when tokenRequest null for response and exception`() = runTest {
         val testSubject = AuthorizationRepository(
             service = service,
+            context = androidx.test.core.app.ApplicationProvider.getApplicationContext(),
         )
         val exception = Exception("Unknown error")
         service.stub {

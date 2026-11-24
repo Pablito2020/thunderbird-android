@@ -1,10 +1,12 @@
 package app.k9mail.feature.account.oauth.data
 
+import android.content.Context
 import android.content.Intent
 import androidx.core.net.toUri
 import app.k9mail.feature.account.oauth.domain.AccountOAuthDomainContract
 import app.k9mail.feature.account.oauth.domain.entity.AuthorizationIntentResult
 import app.k9mail.feature.account.oauth.domain.entity.AuthorizationResult
+import app.k9mail.feature.account.oauth.ui.LoopbackOAuthActivity
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 import net.openid.appauth.AuthState
@@ -20,6 +22,7 @@ import net.thunderbird.legacy.logging.Log
 
 class AuthorizationRepository(
     private val service: AuthorizationService,
+    private val context: Context,
 ) : AccountOAuthDomainContract.AuthorizationRepository {
 
     override fun getAuthorizationRequestIntent(
@@ -69,6 +72,9 @@ class AuthorizationRepository(
     }
 
     private fun createAuthorizationRequestIntent(configuration: OAuthConfiguration, emailAddress: String): Intent {
+        if (configuration.redirectUri == "http://127.0.0.1") {
+            return LoopbackOAuthActivity.createIntent(context, configuration, emailAddress)
+        }
         val serviceConfig = AuthorizationServiceConfiguration(
             configuration.authorizationEndpoint.toUri(),
             configuration.tokenEndpoint.toUri(),
