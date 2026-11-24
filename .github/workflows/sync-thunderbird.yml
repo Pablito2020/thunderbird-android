@@ -208,10 +208,13 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.update.outputs.release_tag }}
       APK_NAME: thunderbird-foss-${{ needs.update.outputs.upstream_tag }}-fork.apk
-      SITE_DIR: ${{ runner.temp }}/fdroid-pages-site
-      WORK_DIR: ${{ runner.temp }}/fdroid-work
 
     steps:
+      - name: Prepare workspace paths
+        run: |
+          echo "SITE_DIR=$RUNNER_TEMP/fdroid-pages-site" >> "$GITHUB_ENV"
+          echo "WORK_DIR=$RUNNER_TEMP/fdroid-work" >> "$GITHUB_ENV"
+
       - name: Checkout repository for restoring the published APK history
         uses: actions/checkout@v4
         with:
