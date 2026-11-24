@@ -1,0 +1,394 @@
+# Put this file on the DEFAULT branch of your fork.
+# Publishes to GitHub Releases AND your own F-Droid repo via GitHub Pages.
+# That branch should start at an upstream stable THUNDERBIRD_* tag,
+# with your custom patch committed on top. Do not start from upstream main.
+name: Sync, release and F-Droid-publish Thunderbird fork
+
+on:
+  schedule:
+    - cron: '23 6 * * *'  # Daily, UTC; manually enable schedules on forks
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: thunderbird-fork-upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  update:
+    permissions:
+      contents: write
+    outputs:
+      upstream_tag: ${{ steps.upstream.outputs.upstream_tag }}
+      release_tag: ${{ steps.upstream.outputs.release_tag }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      UPSTREAM: thunderbird/thunderbird-android
+
+    steps:
+      - name: Check out fork branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select the latest stable Thunderbird release and merge
+        id: upstream
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # GitHub also publishes beta and K-9 Mail releases here.
+          tag="$(gh api "repos/$UPSTREAM/releases?per_page=100" --jq \
+            '[.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^THUNDERBIRD_[0-9]+_[0-9]+$")))] | first | .tag_name')"
+
+          if [[ -z "$tag" || "$tag" == "null" ]]; then
+            echo 'Could not find a stable Thunderbird release.' >&2
+            exit 1
+          fi
+
+          release_tag="fork-${tag}"
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+          # Prevent rebuilding already published versions.
+          if gh release view "$release_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Already published $release_tag; nothing to do."
+            echo 'publish=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo 'publish=true' >> "$GITHUB_OUTPUT"
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/$tag"
+          upstream_commit="$(git rev-parse 'FETCH_HEAD^{commit}')"
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          if git merge-base --is-ancestor "$upstream_commit" HEAD; then
+            echo "Upstream $tag is already part of this branch."
+          else
+            # Any conflict fails this step; GitHub can email you.
+            # Keep our own CI workflows: upstream frequently edits theirs,
+            # and GITHUB_TOKEN cannot push changes to .github/workflows.
+            git merge --no-ff --no-commit "$upstream_commit"
+            git restore --source=HEAD --staged --worktree -- .github/workflows
+            git commit --no-edit
+          fi
+          echo "Merged/test target: $(git rev-parse HEAD)"
+
+      - name: Set up Java 21
+        if: steps.upstream.outputs.publish == 'true'
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Set up Gradle
+        if: steps.upstream.outputs.publish == 'true'
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+
+      - name: Configure Gradle for CI
+        if: steps.upstream.outputs.publish == 'true'
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.gradle"
+          cp .github/ci-gradle.properties "$HOME/.gradle/gradle.properties"
+
+      - name: Run upstream test suite
+        if: steps.upstream.outputs.publish == 'true'
+        run: ./gradlew testsOnCi --no-daemon
+
+      - name: Build the unsigned FOSS release APK
+        if: steps.upstream.outputs.publish == 'true'
+        run: ./gradlew :app-thunderbird:assembleFossRelease --no-daemon
+
+      - name: Align, sign, and verify the APK
+        if: steps.upstream.outputs.publish == 'true'
+        id: apk
+        shell: bash
+        env:
+          SIGNING_KEY_BASE64: ${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
+        run: |
+          set -euo pipefail
+          : "${SIGNING_KEY_BASE64:?Set ANDROID_SIGNING_KEY_BASE64 in Actions secrets}"
+          : "${STORE_PASSWORD:?Set ANDROID_STORE_PASSWORD in Actions secrets}"
+          : "${KEY_ALIAS:?Set ANDROID_KEY_ALIAS in Actions secrets}"
+          : "${KEY_PASSWORD:?Set ANDROID_KEY_PASSWORD in Actions secrets}"
+
+          sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          [[ -d "$sdk/build-tools" ]] || { echo 'Android SDK build-tools missing'; exit 1; }
+          build_tools="$(find "$sdk/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          [[ -x "$build_tools/zipalign" && -x "$build_tools/apksigner" ]]
+
+          unsigned='app-thunderbird/build/outputs/apk/foss/release/app-thunderbird-foss-release-unsigned.apk'
+          [[ -f "$unsigned" ]] || { echo "Missing APK: $unsigned"; exit 1; }
+
+          keystore="$RUNNER_TEMP/fork-signing.jks"
+          aligned="$RUNNER_TEMP/fork-aligned.apk"
+          trap 'rm -f "$keystore" "$aligned"' EXIT
+          printf '%s' "$SIGNING_KEY_BASE64" | base64 --decode > "$keystore"
+          chmod 600 "$keystore"
+
+          mkdir -p dist
+          apk="dist/thunderbird-foss-${UPSTREAM_TAG}-fork.apk"
+          "$build_tools/zipalign" -P 16 -f -v 4 "$unsigned" "$aligned"
+          "$build_tools/apksigner" sign \
+            --ks "$keystore" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass env:STORE_PASSWORD \
+            --key-pass env:KEY_PASSWORD \
+            --out "$apk" "$aligned"
+          "$build_tools/apksigner" verify --verbose "$apk"
+          version_code="$("$build_tools/aapt" dump badging "$apk" | sed -n "s/^package:.*versionCode='\([0-9]*\)'.*/\1/p")"
+          [[ "$version_code" =~ ^[0-9]+$ ]] || { echo 'Could not read APK version code' >&2; exit 1; }
+          if git ls-remote --exit-code --heads origin fdroid-pages >/dev/null 2>&1; then
+            git fetch --no-tags origin refs/heads/fdroid-pages
+            previous_code="$(git show FETCH_HEAD:fdroid/version-code.txt)"
+            [[ "$previous_code" =~ ^[0-9]+$ && "$version_code" -gt "$previous_code" ]] || {
+              echo 'APK version code must exceed the previous published version' >&2; exit 1;
+            }
+          fi
+          printf '%s\n' "$version_code" > dist/version-code.txt
+          (cd dist && sha256sum "$(basename "$apk")" > SHA256SUMS)
+          echo "apk=$apk" >> "$GITHUB_OUTPUT"
+
+      - name: Push verified source and publish APK
+        if: steps.upstream.outputs.publish == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
+          UPSTREAM_TAG: ${{ steps.upstream.outputs.upstream_tag }}
+          APK: ${{ steps.apk.outputs.apk }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Do not expose this write-capable token to upstream Gradle scripts.
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          # Protected branches can block this; if so, configure the branch rules.
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push origin "HEAD:${GITHUB_REF_NAME}"
+          gh release create "$RELEASE_TAG" \
+            "$APK" dist/SHA256SUMS dist/version-code.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$(git rev-parse HEAD)" \
+            --title "Thunderbird fork ($UPSTREAM_TAG)" \
+            --notes "Unofficial FOSS APK based on Thunderbird for Android $UPSTREAM_TAG, with the fork's custom changes. Signed with the fork's own key; not signed by Thunderbird/Mozilla."
+
+      - name: Add run summary
+        if: success() && steps.upstream.outputs.publish == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.upstream.outputs.release_tag }}
+        run: |
+          echo "Published [$RELEASE_TAG](https://github.com/$GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG)" >> "$GITHUB_STEP_SUMMARY"
+
+
+  # This is an INDEPENDENT F-Droid binary repository hosted on GitHub Pages.
+  # It is NOT an upload to f-droid.org's main catalog.
+  publish_fdroid:
+    name: Publish signed APK to personal F-Droid repository
+    needs: update
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      RELEASE_TAG: ${{ needs.update.outputs.release_tag }}
+      APK_NAME: thunderbird-foss-${{ needs.update.outputs.upstream_tag }}-fork.apk
+      SITE_DIR: ${{ runner.temp }}/fdroid-pages-site
+      WORK_DIR: ${{ runner.temp }}/fdroid-work
+
+    steps:
+      - name: Checkout repository for restoring the published APK history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Restore fdroid-pages history (or prepare a new orphan branch)
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          pages="$RUNNER_TEMP/fdroid-pages-tree"
+          if git ls-remote --exit-code --heads origin fdroid-pages >/dev/null 2>&1; then
+            git fetch --depth=1 origin fdroid-pages
+            git worktree add --detach "$pages" FETCH_HEAD
+          else
+            git worktree add --detach "$pages"
+            git -C "$pages" checkout --orphan fdroid-pages
+            git -C "$pages" rm -qrf --ignore-unmatch .
+          fi
+          echo "pages=$pages" >> "$GITHUB_OUTPUT"
+          if [[ -f "$pages/fdroid/repo/$APK_NAME" ]]; then
+            echo 'new_apk=false' >> "$GITHUB_OUTPUT"
+            echo 'This APK is already indexed in the static repo.'
+          else
+            echo 'new_apk=true' >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download the previously built and signed APK
+        if: steps.restore.outputs.new_apk == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/fdroid-download"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$APK_NAME" --pattern version-code.txt \
+            --dir "$RUNNER_TEMP/fdroid-download"
+          test -s "$RUNNER_TEMP/fdroid-download/$APK_NAME"
+          test -s "$RUNNER_TEMP/fdroid-download/version-code.txt"
+
+      - name: Set up Java for repository index signing
+        if: steps.restore.outputs.new_apk == 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install F-Droid index tools
+        if: steps.restore.outputs.new_apk == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/fdroid-venv"
+          "$RUNNER_TEMP/fdroid-venv/bin/pip" install --disable-pip-version-check fdroidserver
+
+      - name: Rebuild and sign the F-Droid repository index
+        if: steps.restore.outputs.new_apk == 'true'
+        shell: bash
+        env:
+          REPO_KEYSTORE_BASE64: ${{ secrets.FDROID_REPO_KEYSTORE_BASE64 }}
+          REPO_PASSWORD: ${{ secrets.FDROID_REPO_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${REPO_KEYSTORE_BASE64:?Add FDROID_REPO_KEYSTORE_BASE64 secret}"
+          : "${REPO_PASSWORD:?Add FDROID_REPO_PASSWORD secret}"
+          mkdir -p "$WORK_DIR/repo/icons" "$WORK_DIR/metadata"
+          old_repo="${{ steps.restore.outputs.pages }}/fdroid/repo"
+          if [[ -d "$old_repo" ]]; then
+            cp -a "$old_repo/." "$WORK_DIR/repo/"
+          fi
+          cp "$RUNNER_TEMP/fdroid-download/$APK_NAME" "$WORK_DIR/repo/$APK_NAME"
+
+          # Keep the latest three APKs on Pages; GitHub Releases keeps the rest.
+          while IFS= read -r old_apk; do
+            rm -f "$WORK_DIR/repo/$old_apk"
+          done < <(find "$WORK_DIR/repo" -maxdepth 1 -type f -name '*.apk' \
+            -printf '%f\n' | sort -V | head -n -3)
+
+          # Create a simple neutral repository icon if needed.
+          export WORK_DIR
+          "$RUNNER_TEMP/fdroid-venv/bin/python" - <<'PYICON'
+          from pathlib import Path
+          from PIL import Image, ImageDraw
+          import os
+          icon = Path(os.environ['WORK_DIR']) / 'repo/icons/icon.png'
+          if not icon.exists():
+              im = Image.new('RGB', (256, 256), '#24334b')
+              d = ImageDraw.Draw(im)
+              d.rounded_rectangle((34, 34, 222, 222), radius=32, fill='#e2e8f0')
+              d.rectangle((80, 92, 176, 111), fill='#24334b')
+              d.polygon([(128, 169), (85, 118), (171, 118)], fill='#24334b')
+              im.save(icon)
+          PYICON
+
+          # YAML is written outside the public Pages tree; never upload secrets.
+          key_file="$RUNNER_TEMP/fdroid-repo.jks"
+          printf '%s' "$REPO_KEYSTORE_BASE64" | base64 --decode > "$key_file"
+          chmod 600 "$key_file"
+          "$RUNNER_TEMP/fdroid-venv/bin/python" - <<'PYCONFIG'
+          from pathlib import Path
+          import os, yaml
+          owner, repo = os.environ['GITHUB_REPOSITORY'].split('/', 1)
+          config = {
+              'repo_url': f'https://{owner}.github.io/{repo}/fdroid/repo',
+              'repo_name': 'Unofficial Thunderbird Fork',
+              'repo_description': 'Unofficial, locally signed Thunderbird Android fork releases.',
+              'repo_keyalias': 'fdroidrepo',
+              'keystore': str(Path(os.environ['RUNNER_TEMP']) / 'fdroid-repo.jks'),
+              'keystorepass': os.environ['REPO_PASSWORD'],
+              'keypass': os.environ['REPO_PASSWORD'],
+              'keydname': 'CN=Unofficial Thunderbird Fork, OU=F-Droid Repository',
+              'make_current_version_link': False,
+          }
+          Path(os.environ['WORK_DIR'], 'config.yml').write_text(
+              yaml.safe_dump(config, default_flow_style=False)
+          )
+          PYCONFIG
+          (
+            cd "$WORK_DIR"
+            "$RUNNER_TEMP/fdroid-venv/bin/fdroid" update --create-metadata
+            test -s repo/index-v1.jar
+          )
+          mkdir -p "${{ steps.restore.outputs.pages }}/fdroid"
+          cp "$RUNNER_TEMP/fdroid-download/version-code.txt" "${{ steps.restore.outputs.pages }}/fdroid/version-code.txt"
+          rm -rf "${{ steps.restore.outputs.pages }}/fdroid/repo"
+          cp -a "$WORK_DIR/repo" "${{ steps.restore.outputs.pages }}/fdroid/repo"
+          # Deliberately do not copy config.yml or the signing keystore.
+          rm -f "$key_file"
+
+      - name: Store F-Droid repo for subsequent releases
+        if: steps.restore.outputs.new_apk == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAGES: ${{ steps.restore.outputs.pages }}
+        run: |
+          set -euo pipefail
+          touch "$PAGES/.nojekyll"
+          cat > "$PAGES/index.html" <<'HTML'
+          <!doctype html><meta charset="utf-8">
+          <title>Unofficial Thunderbird Fork / F-Droid repo</title>
+          <h1>Unofficial Thunderbird Android Fork</h1>
+          <p>Add this repository to your F-Droid client using the URL ending in /fdroid/repo/.</p>
+          <p>This is an independent repository, not the official F-Droid catalog or a Mozilla release.</p>
+          HTML
+          git -C "$PAGES" config user.name 'github-actions[bot]'
+          git -C "$PAGES" config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C "$PAGES" add --all
+          git -C "$PAGES" commit -m "F-Droid: publish $RELEASE_TAG"
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          git -C "$PAGES" -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
+            push origin HEAD:refs/heads/fdroid-pages
+
+      - name: Prepare a clean GitHub Pages upload (without credentials)
+        env:
+          PAGES: ${{ steps.restore.outputs.pages }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "$PAGES/fdroid/repo/index-v1.jar"
+          mkdir -p "$SITE_DIR"
+          cp -a "$PAGES/fdroid" "$SITE_DIR/fdroid"
+          cp -f "$PAGES/index.html" "$SITE_DIR/index.html"
+          touch "$SITE_DIR/.nojekyll"
+
+      - name: Upload F-Droid repository for GitHub Pages
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ${{ runner.temp }}/fdroid-pages-site
+
+      - name: Deploy the F-Droid repository to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Show the subscription URL
+        run: |
+          echo "Add https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/fdroid/repo to your F-Droid app" >> "$GITHUB_STEP_SUMMARY"
